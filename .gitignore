@@ -1,0 +1,14 @@
+.env
+model/
+chroma_db/
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.streamlit/
+.chainlit/*
+!.chainlit/config.toml
+.claude/
+eval_result.*
