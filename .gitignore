@@ -12,3 +12,5 @@ venv/
 !.chainlit/config.toml
 .claude/
 eval_result.*
+docs/t2ranking/passages.json
+docs/t2ranking/chroma_db/
