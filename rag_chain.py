@@ -3,7 +3,6 @@
 文档加载 → 分块 → 向量化 → 检索 → 生成
 """
 import os
-import json
 import logging
 import warnings
 
@@ -77,71 +76,8 @@ def load_documents(docs_dir: str = None):
     docs.extend(txt_loader.load())
     docs.extend(md_loader.load())
 
-    # JSON (CMRC 格式)
-    json_docs, _ = load_cmrc_json(docs_dir)
-    docs.extend(json_docs)
-
     return docs
 
-
-def load_cmrc_json(docs_dir: str = None):
-    """加载 CMRC 2018 JSON 数据集。
-    返回 (documents, qa_pairs)
-    - documents: 每条 context_text → Document (metadata: title, context_id, source)
-    - qa_pairs: [{"question":..., "answers":[...], "context_id":...}, ...]
-    """
-    import glob as _glob
-
-    if docs_dir is None:
-        docs_dir = str(config.DOCS_DIR)
-
-    target = os.path.join(docs_dir, "**", "*.json")
-    json_files = _glob.glob(target, recursive=True)
-
-    documents = []
-    qa_pairs = []
-
-    for filepath in json_files:
-        with open(filepath, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-
-        # 兼容 {"data": [...]} 和 [...] 两种外层
-        if isinstance(raw, dict):
-            entries = raw.get("data", [])
-        elif isinstance(raw, list):
-            entries = raw
-        else:
-            continue
-
-        for entry in entries:
-            context_id = entry.get("context_id", "")
-            context_text = entry.get("context_text", "")
-            title = entry.get("title", "")
-            source = os.path.basename(filepath)
-
-            if not context_text:
-                continue
-
-            # 构建 Document
-            doc = Document(
-                page_content=context_text,
-                metadata={
-                    "source": source,
-                    "context_id": context_id,
-                    "title": title,
-                },
-            )
-            documents.append(doc)
-
-            # 提取 QA 对
-            for qa in entry.get("qas", []):
-                qa_pairs.append({
-                    "question": qa.get("query_text", ""),
-                    "answers": qa.get("answers", []),
-                    "context_id": context_id,
-                })
-
-    return documents, qa_pairs
 
 
 # ============================================================
@@ -211,12 +147,13 @@ def load_llm():
 # 6. 提示词模板
 # ============================================================
 RAG_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是知识库助手，基于提供的文档内容回答问题。
+    ("system", """你是知识库助手，必须基于提供的文档内容回答问题。
 
 规则：
-1. 使用文档中的信息回答，禁止编造
-2. 如果文档中没有相关信息，直接说"文档中未找到相关内容"
-3. 回答简洁清晰，不要啰嗦
+1. 每个回答都要有文档依据，从文档中提取关键事实来组织答案
+2. 禁止编造、猜测或补充文档中没有的信息
+3. 如果文档中完全没有相关信息，回复"文档中未找到相关内容"
+4. 回答简洁清晰，重点突出，以用户能理解的方式呈现
 
 以下是文档中检索到的相关内容：
 
@@ -401,3 +338,17 @@ def retrieve_with_sources(vectorstore, query, search_type=None, k=None):
         }
         for doc in docs
     ]
+
+
+def run_rag_query(vectorstore, question, search_type=None, k=None):
+    """执行一次 RAG 查询，返回 (answer, contexts)。
+    供评估脚本复用，避免重复拼接链逻辑。"""
+    chain = build_rag_chain(
+        vectorstore=vectorstore,
+        search_type=search_type or config.DEFAULT_SEARCH_TYPE,
+        k=k or config.DEFAULT_K,
+    )
+    answer = chain.invoke(question)
+    sources = retrieve_with_sources(vectorstore, question, search_type=search_type, k=k)
+    contexts = [s["content"] for s in sources]
+    return answer, contexts

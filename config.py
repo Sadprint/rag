@@ -36,7 +36,7 @@ SEPARATORS = [
 ]
 
 # ============ 检索配置 ============
-DEFAULT_K = 4              # 默认检索条数
+DEFAULT_K = 3              # 默认检索条数
 DEFAULT_SEARCH_TYPE = "mmr"  # similarity 或 mmr
 MMR_FETCH_K = 10           # MMR 初筛数量
 MMR_LAMBDA_MULT = 0.7      # MMR 多样性权重 (越大越相关, 越小越多样)

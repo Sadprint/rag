@@ -6,8 +6,7 @@ import sys as _sys
 import types as _types
 import importlib.machinery as _machinery
 
-# ── onnxruntime DLL 在此 Windows 环境损坏，chromadb 导入时会实例化默认 ONNX
-#    嵌入函数。我们用 BGE 嵌入不需要它，mock 掉即可。 ──
+# ── onnxruntime mock ──
 class _FakeORT(_types.ModuleType):
     def __init__(self, name): super().__init__(name)
     @staticmethod
@@ -47,6 +46,7 @@ from rag_chain import (
     split_documents,
     create_vectorstore,
     load_vectorstore,
+    load_t2ranking_vectorstore,
     build_rag_chain,
     retrieve_with_sources,
 )
@@ -64,9 +64,10 @@ import config
 init_db()
 
 
-# ==================== Action Handlers (payload callables) ====================
+# ==================== Action Callbacks ====================
 
-async def handle_build_vs():
+@cl.action_callback("build_vs")
+async def on_build_vs(action: cl.Action):
     settings = cl.user_session.get("settings")
     msg = cl.Message(content="⏳ 正在读取文档并构建向量库...")
     await msg.send()
@@ -80,6 +81,8 @@ async def handle_build_vs():
         chunks = split_documents(docs, settings["chunk_size"], settings["chunk_overlap"])
         vs = create_vectorstore(chunks, embeddings)
         cl.user_session.set("vectorstore", vs)
+        vs_source = f"本地文档 ({vs._collection.count():,} 条)"
+        cl.user_session.set("vs_source", vs_source)
         msg.content = f"✅ 构建完成！{len(docs)} 个文档 → {len(chunks)} 个向量块"
         await msg.update()
     except Exception as e:
@@ -87,13 +90,16 @@ async def handle_build_vs():
         await msg.update()
 
 
-async def handle_load_vs():
+@cl.action_callback("load_vs")
+async def on_load_vs(action: cl.Action):
     msg = cl.Message(content="⏳ 正在加载向量库...")
     await msg.send()
     try:
         embeddings = cl.user_session.get("embeddings")
         vs = load_vectorstore(embeddings)
         cl.user_session.set("vectorstore", vs)
+        vs_source = f"本地文档 ({vs._collection.count():,} 条)"
+        cl.user_session.set("vs_source", vs_source)
         msg.content = "✅ 向量库加载完成"
         await msg.update()
     except Exception as e:
@@ -101,14 +107,17 @@ async def handle_load_vs():
         await msg.update()
 
 
-async def handle_new_conv():
+@cl.action_callback("new_conv")
+async def on_new_conv(action: cl.Action):
     conv_id = create_conversation()
     cl.user_session.set("conversation_id", conv_id)
     cl.user_session.set("history", [])
     await cl.Message(content="✅ 新对话已创建，开始提问吧").send()
 
 
-async def handle_switch_conv(cid: int):
+@cl.action_callback("switch_conv")
+async def on_switch_conv(action: cl.Action):
+    cid = action.payload["cid"]
     cl.user_session.set("conversation_id", cid)
     db_msgs = get_messages(cid)
     cl.user_session.set("history", [
@@ -118,7 +127,9 @@ async def handle_switch_conv(cid: int):
     await cl.Message(content=f"✅ 已切换到对话 #{cid}（{len(db_msgs)} 条历史消息）").send()
 
 
-async def handle_delete_conv(cid: int):
+@cl.action_callback("delete_conv")
+async def on_delete_conv(action: cl.Action):
+    cid = action.payload["cid"]
     delete_conversation(cid)
     current = cl.user_session.get("conversation_id")
     if current == cid:
@@ -128,7 +139,8 @@ async def handle_delete_conv(cid: int):
     await cl.Message(content=f"✅ 对话 #{cid} 已删除").send()
 
 
-async def handle_manage_conv():
+@cl.action_callback("manage_conv")
+async def on_manage_conv(action: cl.Action):
     conversations = get_conversations()
     current_id = cl.user_session.get("conversation_id")
 
@@ -139,21 +151,21 @@ async def handle_manage_conv():
         marker = " [当前]" if cid == current_id else ""
 
         actions.append(cl.Action(
-            name=f"switch_{cid}",
-            payload=lambda c=cid: handle_switch_conv(c),
+            name="switch_conv",
+            payload={"cid": cid},
             label=f"{title}{marker}",
             description=conv.get("updated_at", "")[:16],
         ))
         actions.append(cl.Action(
-            name=f"delete_{cid}",
-            payload=lambda c=cid: handle_delete_conv(c),
+            name="delete_conv",
+            payload={"cid": cid},
             label=f"🗑 删除「{title[:10]}」",
             description="删除对话及其所有消息",
         ))
 
     actions.append(cl.Action(
         name="new_conv",
-        payload=handle_new_conv,
+        payload={},
         label="➕ 新建对话",
     ))
 
@@ -173,13 +185,21 @@ async def start():
     embeddings = load_embedding_model()
     cl.user_session.set("embeddings", embeddings)
 
-    # 尝试加载已有向量库
+    # 优先加载 T2Ranking 向量库（123,354 篇中文段落），其次加载本地文档库
     vs = None
-    try:
-        vs = load_vectorstore(embeddings)
-    except Exception:
-        pass
+    vs_source = ""
+    vs = load_t2ranking_vectorstore(embeddings)
+    if vs is not None:
+        vs_source = f"T2Ranking ({vs._collection.count():,} 篇段落)"
+    else:
+        try:
+            vs = load_vectorstore(embeddings)
+            if vs is not None:
+                vs_source = f"本地文档 ({vs._collection.count():,} 条)"
+        except Exception:
+            pass
     cl.user_session.set("vectorstore", vs)
+    cl.user_session.set("vs_source", vs_source)
 
     # 配置面板
     await cl.ChatSettings([
@@ -227,7 +247,7 @@ async def start():
     await msg.update()
 
     # 欢迎消息
-    vs_status = "✅ 已加载" if vs is not None else "⚠️ 未加载，请点击按钮"
+    vs_status = f"✅ {vs_source}" if vs is not None else "⚠️ 未加载，请点击按钮"
     await cl.Message(
         content=f"""# 📚 本地文档智能问答
 
@@ -239,10 +259,10 @@ async def start():
 
 在右侧 ⚙️ 图标中调整检索参数。使用下方按钮管理系统：""",
         actions=[
-            cl.Action(name="build_vs", payload=handle_build_vs, label="🔄 构建向量库"),
-            cl.Action(name="load_vs", payload=handle_load_vs, label="📂 加载已有向量库"),
-            cl.Action(name="new_conv", payload=handle_new_conv, label="➕ 新建对话"),
-            cl.Action(name="manage_conv", payload=handle_manage_conv, label="💬 管理对话"),
+            cl.Action(name="build_vs", payload={}, label="🔄 构建向量库"),
+            cl.Action(name="load_vs", payload={}, label="📂 加载已有向量库"),
+            cl.Action(name="new_conv", payload={}, label="➕ 新建对话"),
+            cl.Action(name="manage_conv", payload={}, label="💬 管理对话"),
         ],
     ).send()
 
@@ -272,8 +292,8 @@ async def main(message: cl.Message):
         await cl.Message(
             content="⚠️ 向量库未加载，请先点击按钮：",
             actions=[
-                cl.Action(name="build_vs", payload=handle_build_vs, label="🔄 构建向量库"),
-                cl.Action(name="load_vs", payload=handle_load_vs, label="📂 加载已有向量库"),
+                cl.Action(name="build_vs", payload={}, label="🔄 构建向量库"),
+                cl.Action(name="load_vs", payload={}, label="📂 加载已有向量库"),
             ],
         ).send()
         return
