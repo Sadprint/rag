@@ -21,7 +21,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
 import config
@@ -144,7 +144,67 @@ def load_llm():
 
 
 # ============================================================
-# 6. 提示词模板
+# 6. 问题改写 (Query Rewriting)
+# ============================================================
+def rewrite_query(user_question, chat_history=None):
+    """将用户问题改写为适合检索的独立查询。
+
+    处理两类问题:
+    1. 问句形式转换（始终生效）
+       "你知道心肌酶组套吗？" → "心肌酶组套 定义 介绍"
+       "能不能告诉我什么是RAG？" → "RAG 是什么"
+    2. 指代消解（存在对话历史时）
+       "它为什么会这样？" → "RAG 系统召回率低的原因是什么"
+
+    改写失败时返回原始问题。
+    """
+    history = chat_history or []
+
+    # 格式化历史为对话文本（存在时）
+    history_section = ""
+    if history:
+        history_text = ""
+        for m in history[-6:]:
+            role = "用户" if m["role"] == "user" else "助手"
+            history_text += f"{role}: {m['content']}\n"
+        history_section = f"""对话历史：
+{history_text}"""
+
+    # 有历史时同时做指代消解 + 问句标准化，无历史时只做问句标准化
+    base_rules = [
+        '将疑问句式转换为保留查询意图的关键词（如「你知道X吗」→「X 介绍 解释」、「X是什么意思」→「X 定义」）',
+        '移除口语化填充词（「你知道」「请问」「能不能告诉我」「吗」「呢」「吧」等）',
+        '保留核心检索语义，去除礼貌用语和寒暄',
+    ]
+    anaphora_rules = [
+        '将指代词（「它」「这个」「那个」「这样」「这些」）替换为对话历史中提到的具体内容',
+        '补全省略的主语、宾语和上下文信息',
+    ]
+
+    rules = base_rules + (anaphora_rules if history else base_rules)
+    rules_text = "\n".join(f"{i + 1}. {r}" for i, r in enumerate(rules))
+
+    rewrite_prompt = f"""你的任务是将用户问题改写为适合向量检索的关键词查询。
+
+规则：
+{rules_text}
+{len(rules) + 1}. 只输出改写后的查询文本，不要加引号或任何解释
+
+{history_section}
+用户问题：{user_question}
+
+改写后的查询："""
+
+    try:
+        llm = load_llm()
+        rewritten = llm.invoke(rewrite_prompt).content.strip()
+        return rewritten if rewritten else user_question
+    except Exception:
+        return user_question
+
+
+# ============================================================
+# 7. 提示词模板
 # ============================================================
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是知识库助手，必须基于提供的文档内容回答问题。
@@ -164,7 +224,7 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
 
 
 # ============================================================
-# 7. 获取/构建向量库 (一键)
+# 8. 获取/构建向量库 (一键)
 # ============================================================
 def get_or_create_vectorstore(force_rebuild=False):
     """获取向量库，不存在则构建"""
@@ -186,12 +246,22 @@ def get_or_create_vectorstore(force_rebuild=False):
 
 
 # ============================================================
-# 8. RAG 链 (LCEL)
+# 9. RAG 链 (LCEL)
 # ============================================================
-def build_rag_chain(retriever=None, vectorstore=None, search_type=None, k=None, chat_history=None):
-    """构建 LCEL RAG 链，chat_history 为最近几轮对话列表 [{'role':'user'/'assistant', 'content':...}, ...]"""
+def build_rag_chain(retriever=None, vectorstore=None, search_type=None, k=None, chat_history=None, query=None):
+    """构建 LCEL RAG 链。
+
+    chat_history: 最近几轮对话列表 [{'role':'user'/'assistant', 'content':...}, ...]
+    query: 改写后的检索查询。提供时用于检索，但 LLM 仍看到原始用户问题。
+          不提供时检索和生成使用同一个输入。
+    """
     if retriever is None and vectorstore is not None:
         retriever = get_retriever(vectorstore, search_type=search_type, k=k)
+
+    # 如果提供了改写查询，用它做检索，而非原始用户输入
+    if query is not None:
+        _ret = retriever
+        retriever = RunnableLambda(lambda _: _ret.invoke(query))
 
     llm = load_llm()
     history = chat_history or []
@@ -221,7 +291,7 @@ def build_rag_chain(retriever=None, vectorstore=None, search_type=None, k=None, 
 
 
 # ============================================================
-# 9. T2Ranking 数据加载
+# 10. T2Ranking 数据加载
 # ============================================================
 def load_t2ranking_passages(docs_dir=None):
     """加载 T2Ranking 数据集 passage，返回 List[Document]。
@@ -324,7 +394,7 @@ def load_t2ranking_vectorstore(embeddings, docs_dir=None):
 
 
 # ============================================================
-# 10. 检索 + 来源返回
+# 11. 检索 + 来源返回
 # ============================================================
 def retrieve_with_sources(vectorstore, query, search_type=None, k=None):
     """检索并返回带来源的文档列表，供前端展示"""

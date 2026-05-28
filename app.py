@@ -49,6 +49,7 @@ from rag_chain import (
     load_t2ranking_vectorstore,
     build_rag_chain,
     retrieve_with_sources,
+    rewrite_query,
 )
 from database import (
     init_db,
@@ -298,14 +299,18 @@ async def main(message: cl.Message):
         ).send()
         return
 
+    # 问题改写：利用对话历史将指代性问题转为独立检索查询
+    rewritten_query = rewrite_query(message.content, history)
+
     chain = build_rag_chain(
         vectorstore=vs,
         search_type=settings["search_type"],
         k=settings["k"],
         chat_history=history[-6:],
+        query=rewritten_query,  # 检索用改写后的查询
     )
 
-    sources = retrieve_with_sources(vs, message.content, search_type=settings["search_type"], k=settings["k"])
+    sources = retrieve_with_sources(vs, rewritten_query, search_type=settings["search_type"], k=settings["k"])
 
     response_msg = cl.Message(content="")
     await response_msg.send()
@@ -313,6 +318,13 @@ async def main(message: cl.Message):
     full_response = chain.invoke(message.content)
 
     elements = []
+    # 问题被改写时展示改写结果（调试用）
+    if rewritten_query != message.content:
+        elements.append(cl.Text(
+            name="查询改写",
+            content=f"原始: {message.content}\n改写: {rewritten_query}",
+            display="side",
+        ))
     if sources:
         for i, s in enumerate(sources, 1):
             source_name = Path(s.get("source", "未知")).name
